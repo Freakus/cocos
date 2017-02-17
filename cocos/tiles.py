@@ -49,6 +49,7 @@ from math import ceil, sqrt, floor
 import struct
 import weakref
 from xml.etree import ElementTree
+from collections import OrderedDict
 
 import pyglet
 from pyglet import gl
@@ -86,7 +87,7 @@ class Resource(object):
         self.filename = filename
 
         # id to map, tileset, etc.
-        self.contents = {}
+        self.contents = OrderedDict()
 
         # list of (namespace, Resource) from <requires> tags
         self.requires = []
@@ -304,6 +305,19 @@ def load_tmx(filename):
     else:
         raise ValueError("Unsuported tiling style, must be 'orthogonal' or 'hexagonal'")
 
+    # Load map properties
+    resource.properties = {}
+    props = map.find('properties')
+    if props is not None:
+        for p in props.findall('property'):
+            # store additional properties.
+            name = p.attrib['name']
+            value = p.attrib['value']
+            # TODO consider more type conversions?
+            if value.isdigit():
+                value = int(value)
+            resource.properties[name] = value
+    
     # load all the tilesets
     tilesets = []
     for tag in map.findall('tileset'):
@@ -318,6 +332,9 @@ def load_tmx(filename):
         name = tag.attrib['name']
 
         spacing = int(tag.attrib.get('spacing', 0))
+        
+        animated_tiles = {}
+        
         for c in tag.getchildren():
             if c.tag == "image":
                 # create a tileset from the image atlas
@@ -332,6 +349,24 @@ def load_tmx(filename):
                 # add properties to tiles in the tileset
                 gid = tileset.firstgid + int(c.attrib['id'])
                 tile = tileset[gid]
+                # I am not certain this is the safest or best way to identify animation
+                # entities, nor to parse their data.
+                anim = c.find('animation')
+                if anim is not None:
+                    if anim.find('frame') is not None:
+                        frames = []
+                        frame_elements = anim.findall('frame')
+                        for f in frame_elements:
+                            frame_gid = tileset.firstgid + int(f.attrib['tileid'])
+                            # Tiled uses milliseconds rather than seconds for frame duration.
+                            duration = float(f.attrib['duration']) / 1000.0
+                            frames.append(pyglet.image.AnimationFrame(tileset[frame_gid].image, duration))
+                        # Initially I overwrote tile.image directly, but I managed to craft some
+                        # terrible recursion in my TMX file that resulted in all sorts of pain.
+                        # I don't know if this can be done through Tiled but it's easy enough in XML
+                        # As such, for the sake of safety and sanity, I'm maintaining a dict.
+                        animated_tiles[gid] = pyglet.image.Animation(frames)
+                        
                 props = c.find('properties')
                 if props is None:
                     continue
@@ -343,66 +378,70 @@ def load_tmx(filename):
                     if value.isdigit():
                         value = int(value)
                     tile.properties[name] = value
+        for gid,anim in animated_tiles.items():
+            tileset[gid].image = anim
 
-    # now load all the layers
-    for layer in map.findall('layer'):
-        data = layer.find('data')
-        if data is None:
-            raise ValueError('layer %s does not contain <data>' % layer.name)
+    # now load all the layers & objectgroups
+    for layer in [layer for layer in map.getchildren() if layer.tag in ('layer', 'objectgroup')]:
+        # Layers
+        if layer.tag == 'layer':
+            data = layer.find('data')
+            if data is None:
+                raise ValueError('layer %s does not contain <data>' % layer.name)
 
-        encoding = data.attrib.get('encoding')
-        compression = data.attrib.get('compression')
-        if encoding is None:
-            # tiles data as xml
-            data = [int(tile.attrib.get('gid')) for tile in data.findall('tile')]
-        else:
-            data = data.text.strip()
-            if encoding == 'csv':
-                data.replace('\n', '')
-                data = [int(s) for s in data.split(',')]
-            elif encoding == 'base64':
-                data = decode_base64(data)
-                if compression == 'zlib':
-                    data = decompress_zlib(data)
-                elif compression == 'gzip':
-                    data = decompress_gzip(data)
-                elif compression is None:
-                    pass
+            encoding = data.attrib.get('encoding')
+            compression = data.attrib.get('compression')
+            if encoding is None:
+                # tiles data as xml
+                data = [int(tile.attrib.get('gid')) for tile in data.findall('tile')]
+            else:
+                data = data.text.strip()
+                if encoding == 'csv':
+                    data.replace('\n', '')
+                    data = [int(s) for s in data.split(',')]
+                elif encoding == 'base64':
+                    data = decode_base64(data)
+                    if compression == 'zlib':
+                        data = decompress_zlib(data)
+                    elif compression == 'gzip':
+                        data = decompress_gzip(data)
+                    elif compression is None:
+                        pass
+                    else:
+                        raise ResourceError('Unknown compression method: %r' % compression)
+                    data = struct.unpack(str('<%di' % (len(data) // 4)), data)
                 else:
-                    raise ResourceError('Unknown compression method: %r' % compression)
-                data = struct.unpack(str('<%di' % (len(data) // 4)), data)
-            else:
-                raise TmxUnsupportedVariant("Unsupported tiles layer format " +
-                                            "use 'csv', 'xml' or one of " +
-                                            "the 'base64'")
+                    raise TmxUnsupportedVariant("Unsupported tiles layer format " +
+                                                "use 'csv', 'xml' or one of " +
+                                                "the 'base64'")
 
-        assert len(data) == width * height
+            assert len(data) == width * height
 
-        cells = [[None] * height for x in range(width)]
-        for n, gid in enumerate(data):
-            if gid < 1:
-                tile = None
-            else:
-                # UGH
-                for ts in tilesets:
-                    if gid in ts:
-                        tile = ts[gid]
-                        break
-            i = n % width
-            j = height - (n // width + 1)
-            cells[i][j] = cell_cls(i, j, tile_width, tile_height, {}, tile)
+            cells = [[None] * height for x in range(width)]
+            for n, gid in enumerate(data):
+                if gid < 1:
+                    tile = None
+                else:
+                    # UGH
+                    for ts in tilesets:
+                        if gid in ts:
+                            tile = ts[gid]
+                            break
+                i = n % width
+                j = height - (n // width + 1)
+                cells[i][j] = cell_cls(i, j, tile_width, tile_height, {}, tile)
 
-        id = layer.attrib['name']
+            id = layer.attrib['name']
 
-        m = layer_cls(id, tile_width, tile_height, cells, None, {})
-        m.visible = int(layer.attrib.get('visible', 1))
+            m = layer_cls(id, tile_width, tile_height, cells, None, {})
+            m.visible = int(layer.attrib.get('visible', 1))
 
-        resource.add_resource(id, m)
+            resource.add_resource(id, m)
 
-    # finally, object groups
-    for tag in map.findall('objectgroup'):
-        layer = TmxObjectLayer.fromxml(tag, tilesets, map_height_pixels)
-        resource.add_resource(layer.name, layer)
+        # object groups
+        elif layer.tag == 'objectgroup':
+            obj_layer = TmxObjectLayer.fromxml(layer, tilesets, map_height_pixels)
+            resource.add_resource(obj_layer.name, obj_layer)
 
     return resource
 
@@ -631,7 +670,7 @@ class TileSet(dict):
                                               atlas[j, i].height)
 
                 # Set texture clamping to avoid mis-rendering subpixel edges
-                gl.glBindTexture(tile_image.texture.target,  tile_image.texture.id)
+                gl.glBindTexture(tile_image.texture.target, id)
                 gl.glTexParameteri(tile_image.texture.target,
                                    gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
                 gl.glTexParameteri(tile_image.texture.target,
@@ -866,6 +905,7 @@ class MapLayer(cocos.layer.ScrollableLayer):
         for k in list(self._sprites):
             if k not in keep and k in self._sprites:
                 self._sprites[k]._label = None
+                self._sprites[k].delete()
                 del self._sprites[k]
 
     def find_cells(self, **requirements):
@@ -1586,8 +1626,12 @@ class TmxObject(Rect):
     def __init__(self, tmxtype, usertype, x, y, width=0, height=0, name=None,
                  gid=None, tile=None, visible=1, points=None):
         if tile:
-            width = tile.image.width
-            height = tile.image.height
+            if isinstance(tile.image, pyglet.image.Animation):
+                width = tile.image.get_max_width()
+                height = tile.image.get_max_height()
+            else:
+                width = tile.image.width
+                height = tile.image.height
         super(TmxObject, self).__init__(x, y, width, height)
         self.tmxtype = tmxtype
         self.px = x
@@ -1669,8 +1713,12 @@ class TmxObject(Rect):
                 if gid in ts:
                     tile = ts[gid]
                     break
-            w = tile.image.width
-            h = tile.image.height
+            if isinstance(tile.image, pyglet.image.Animation):
+                w = tile.image.get_max_width()
+                h = tile.image.get_max_height()
+            else:
+                w = tile.image.width
+                h = tile.image.height
         else:
             gid = None
             tile = None
